@@ -3,33 +3,30 @@
 Slack Token Extractor - Playwright Edition
 
 Extract Slack XOXC and XOXD tokens using Playwright automation.
-Modern alternative to Selenium with better performance and reliability.
+Each MCP server gets its own isolated browser profile and credentials file
+so tokens are independent and don't expire together.
 
-Features:
-- Persistent browser profile (login once, reuse session)
-- Automatic token extraction from localStorage and cookies
-- Works with multiple workspaces
-- Optional .env file export
+Servers:
+    slack       — primary read/write MCP (Work workspace)
+    slack-cncf  — read-only CNCF fork (job searching)
+    slack-k8s   — read-only K8s workspace
 
 Requirements:
     pip install playwright
     playwright install chromium
 
 Usage:
-    python playwright_extract.py [--workspace URL] [--headless] [--output FILE]
+    # Refresh a specific server's tokens
+    python playwright_extract.py --server slack
 
-Examples:
-    # Interactive mode (opens browser)
-    python playwright_extract.py
+    # Refresh all servers sequentially (opens browser 3 times)
+    python playwright_extract.py --server all
 
-    # Specific workspace
-    python playwright_extract.py --workspace https://mycompany.slack.com
+    # Headless mode (requires existing session in that profile)
+    python playwright_extract.py --server slack --headless
 
-    # Headless mode (requires existing session)
-    python playwright_extract.py --headless
-
-    # Save to custom file
-    python playwright_extract.py --output ~/.slack_tokens.env
+    # Show current token status across all servers
+    python playwright_extract.py --status
 """
 
 import argparse
@@ -47,27 +44,60 @@ except ImportError:
     sys.exit(1)
 
 
-# Default persistent profile location
-DEFAULT_PROFILE_DIR = Path.home() / ".slack-token-extractor" / "browser-profile"
-DEFAULT_OUTPUT_FILE = ".slack_tokens.env"
+# ── Server definitions ────────────────────────────────────────────────
+
+BASE_PROFILE_DIR = Path.home() / ".slack-token-extractor"
+MCP_CONFIG = Path.home() / ".claude.json"
+CREDS_DIR = Path.home() / ".config" / "slack-cli"
+
+# Each server has: MCP name, browser profile dir, credentials file, workspace URL
+SERVERS = {
+    "slack": {
+        "mcp_name": "slack",
+        "profile_dir": BASE_PROFILE_DIR / "profile-slack",
+        "creds_file": CREDS_DIR / "credentials.json",
+        "workspace": "https://example-workspace.slack.com",
+        "description": "Primary read/write MCP (Work)",
+    },
+    "slack-cncf": {
+        "mcp_name": "slack-cncf",
+        "profile_dir": BASE_PROFILE_DIR / "profile-slack-cncf",
+        "creds_file": CREDS_DIR / "credentials-cncf.json",
+        "workspace": "https://cloud-native.slack.com",
+        "description": "Read-only CNCF fork (job searching)",
+    },
+    "slack-k8s": {
+        "mcp_name": "slack-k8s",
+        "profile_dir": BASE_PROFILE_DIR / "profile-slack-k8s",
+        "creds_file": CREDS_DIR / "credentials-k8s.json",
+        "workspace": "https://kubernetes.slack.com",
+        "description": "Read-only K8s workspace",
+    },
+}
+
+# Scripts that read credentials — they use the primary "slack" creds file
+# (slack-summary.py and slack_pr.py now read from MCP config first)
+SCRIPT_CREDS = CREDS_DIR / "credentials.json"
 
 
 def extract_tokens(
     workspace_url: str = "https://app.slack.com/client/",
     headless: bool = False,
-    profile_dir: Path = DEFAULT_PROFILE_DIR,
+    profile_dir: Path = BASE_PROFILE_DIR / "profile-slack",
 ) -> dict | None:
     """
     Extract XOXC token and XOXD cookie from Slack.
 
-    Args:
-        workspace_url: Slack workspace URL to open
-        headless: Run browser in headless mode (requires existing session)
-        profile_dir: Directory for persistent browser profile
+    Profile dir is wiped and recreated on interactive runs to guarantee a fresh
+    browser session → independent token pair per server.
+    Headless runs preserve the existing profile to reuse saved sessions.
 
     Returns:
         Dictionary with 'xoxc_token', 'xoxd_token', and 'team_id' or None on failure
     """
+    import shutil
+    if not headless and profile_dir.exists():
+        shutil.rmtree(profile_dir)
     profile_dir.mkdir(parents=True, exist_ok=True)
 
     with sync_playwright() as p:
@@ -87,18 +117,31 @@ def extract_tokens(
 
         page = browser.pages[0] if browser.pages else browser.new_page()
 
-        print(f"Navigating to {workspace_url}...")
-        page.goto(workspace_url)
+        # Block the "open in Slack app" redirect
+        page.add_init_script("""
+            window.addEventListener('beforeunload', (e) => { e.preventDefault(); });
+            if (navigator.registerProtocolHandler) {
+                navigator.registerProtocolHandler = () => {};
+            }
+        """)
 
-        # Wait for page to load
+        # Navigate to the web client
+        web_url = workspace_url.rstrip("/")
+        if "/client" not in web_url:
+            web_url = web_url + "/"
+        print(f"Navigating to {web_url}...")
+        page.goto(web_url)
+
         try:
             page.wait_for_load_state("networkidle", timeout=30000)
         except PlaywrightTimeout:
-            pass  # Continue anyway, page might be loaded enough
+            pass
 
-        # Check if we need to log in
         current_url = page.url
-        if "signin" in current_url or "sign_in" in current_url or "ssb/signin" in current_url:
+        # Only /client/ means we're actually inside the workspace
+        needs_login = "/client/" not in current_url
+
+        if needs_login:
             if headless:
                 print("\nError: Not logged in and running in headless mode.")
                 print("Run without --headless first to log in.")
@@ -106,24 +149,51 @@ def extract_tokens(
                 return None
 
             print("\n" + "=" * 60)
-            print("Please log in to Slack in the browser window.")
-            print("Press ENTER here when you're logged in and see your workspace...")
+            print("Log in and get to the workspace in the browser.")
+            print("Click through any popups ('Use in browser', etc).")
+            print("Script will detect when tokens appear in localStorage.")
             print("=" * 60)
-            input()
 
-            # Wait for redirect to workspace
+            import time
+
+            # Poll localStorage for xoxc token (works regardless of URL)
+            for i in range(360):  # 6 minutes max
+                time.sleep(1)
+                if i % 5 == 0:
+                    print(f"  [{i}s] waiting... URL: {page.url}")
+                try:
+                    token = page.evaluate("""() => {
+                        try {
+                            const config = JSON.parse(localStorage.localConfig_v2 || '{}');
+                            for (const [tid, data] of Object.entries(config.teams || {})) {
+                                if (data.token && data.token.startsWith('xoxc-')) {
+                                    return data.token.substring(0, 20);
+                                }
+                            }
+                        } catch {}
+                        return null;
+                    }""")
+                    if token:
+                        print(f"  Token detected in localStorage: {token}...")
+                        break
+                except Exception:
+                    pass  # Page might be navigating
+            else:
+                print(f"Timed out waiting for login. Last URL: {page.url}")
+                browser.close()
+                return None
+
             try:
-                page.wait_for_url("**/client/**", timeout=10000)
-                page.wait_for_load_state("networkidle", timeout=30000)
+                page.wait_for_load_state("networkidle", timeout=10000)
             except PlaywrightTimeout:
                 pass
 
-        # Extract team ID from URL
+        # Extract team ID
         current_path = page.url
+        print(f"Extracting team ID from: {current_path}")
         team_id_match = re.search(r"/client/([A-Z0-9]+)", current_path)
 
         if not team_id_match:
-            # Try to get it from localStorage
             team_id = page.evaluate("""() => {
                 try {
                     const config = JSON.parse(localStorage.localConfig_v2 || '{}');
@@ -136,7 +206,6 @@ def extract_tokens(
 
         if not team_id:
             print("\nError: Could not determine team ID.")
-            print("Make sure you're viewing a Slack workspace.")
             browser.close()
             return None
 
@@ -150,7 +219,6 @@ def extract_tokens(
                 if (config.teams && config.teams[teamId]) {
                     return config.teams[teamId].token;
                 }
-                // Fallback: search all teams
                 for (const [tid, data] of Object.entries(config.teams || {})) {
                     if (data.token && data.token.startsWith('xoxc-')) {
                         return data.token;
@@ -161,7 +229,6 @@ def extract_tokens(
         }""", team_id)
 
         if not xoxc_token:
-            # Fallback: try to find in page content
             xoxc_token = page.evaluate("""() => {
                 const match = document.body.innerHTML.match(/"token":"(xoxc-[^"]+)"/);
                 return match ? match[1] : null;
@@ -169,7 +236,6 @@ def extract_tokens(
 
         if not xoxc_token:
             print("\nError: Could not find XOXC token.")
-            print("Make sure you're logged in and the workspace is fully loaded.")
             browser.close()
             return None
 
@@ -201,91 +267,214 @@ def extract_tokens(
         }
 
 
-def save_tokens(tokens: dict, output_file: str) -> None:
-    """Save tokens to a .env file."""
-    with open(output_file, "w") as f:
-        f.write(f"# Slack tokens extracted by slack-token-extractor\n")
-        f.write(f"# Team ID: {tokens['team_id']}\n\n")
-        f.write(f"SLACK_MCP_XOXC_TOKEN={tokens['xoxc_token']}\n")
-        f.write(f"SLACK_MCP_XOXD_TOKEN={tokens['xoxd_token']}\n")
+# ── Per-server token storage ──────────────────────────────────────────
 
-    # Secure the file
-    os.chmod(output_file, 0o600)
-    print(f"\nTokens saved to: {output_file}")
+def store_tokens(server_name: str, tokens: dict) -> list[str]:
+    """Write tokens to the target server's MCP env and credentials file.
+
+    Only touches the specified server — never overwrites other servers' tokens.
+
+    Returns list of updated stores for display.
+    """
+    server = SERVERS[server_name]
+    xoxc = tokens["xoxc_token"]
+    xoxd = tokens["xoxd_token"]
+    team_id = tokens.get("team_id", "")
+    updated: list[str] = []
+
+    # 1. Update this server's env in ~/.claude.json
+    mcp_name = server["mcp_name"]
+    if MCP_CONFIG.exists():
+        try:
+            cfg = json.loads(MCP_CONFIG.read_text())
+            srv = cfg.get("mcpServers", {}).get(mcp_name)
+            if srv is not None:
+                env = srv.setdefault("env", {})
+                env["SLACK_MCP_XOXC_TOKEN"] = xoxc
+                env["SLACK_MCP_XOXD_TOKEN"] = xoxd
+                MCP_CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
+                MCP_CONFIG.chmod(0o600)
+                updated.append(f"MCP:{mcp_name}")
+            else:
+                print(f"  Warning: MCP server '{mcp_name}' not found in {MCP_CONFIG}", file=sys.stderr)
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"  Warning: failed to update {MCP_CONFIG}: {e}", file=sys.stderr)
+
+    # 2. Update this server's credentials file
+    creds_file = server["creds_file"]
+    try:
+        creds_file.parent.mkdir(parents=True, exist_ok=True)
+        creds = {
+            "token": xoxc,
+            "cookie": xoxd,
+            "team": "work",
+            "team_id": team_id,
+            "user": "mark",
+            "server": server_name,
+        }
+        creds_file.write_text(json.dumps(creds, indent=2) + "\n")
+        os.chmod(str(creds_file), 0o600)
+        updated.append(f"creds:{creds_file.name}")
+    except OSError as e:
+        print(f"  Warning: failed to update {creds_file}: {e}", file=sys.stderr)
+
+    return updated
+
+
+def show_status() -> None:
+    """Show current token status for all servers."""
+    print("Slack Token Status")
+    print("=" * 70)
+
+    # Load MCP config once
+    mcp_cfg = {}
+    if MCP_CONFIG.exists():
+        try:
+            mcp_cfg = json.loads(MCP_CONFIG.read_text()).get("mcpServers", {})
+        except json.JSONDecodeError:
+            pass
+
+    for name, server in SERVERS.items():
+        mcp_name = server["mcp_name"]
+        desc = server["description"]
+
+        # MCP token
+        mcp_env = mcp_cfg.get(mcp_name, {}).get("env", {})
+        mcp_xoxc = mcp_env.get("SLACK_MCP_XOXC_TOKEN", "")
+        mcp_status = f"{mcp_xoxc[:20]}..." if mcp_xoxc.startswith("xoxc-") else "MISSING"
+
+        # Creds file token
+        creds_file = server["creds_file"]
+        if creds_file.exists():
+            try:
+                creds = json.loads(creds_file.read_text())
+                creds_xoxc = creds.get("token", "")
+                creds_status = f"{creds_xoxc[:20]}..." if creds_xoxc.startswith("xoxc-") else "INVALID"
+                # Check if they match
+                match = "SYNCED" if mcp_xoxc == creds_xoxc else "DIVERGED"
+            except json.JSONDecodeError:
+                creds_status = "CORRUPT"
+                match = "N/A"
+        else:
+            creds_status = "NO FILE"
+            match = "N/A"
+
+        # MCP server exists?
+        mcp_exists = mcp_name in mcp_cfg
+
+        print(f"\n{name} — {desc}")
+        print(f"  MCP server:  {'present' if mcp_exists else 'NOT CONFIGURED'}")
+        print(f"  MCP token:   {mcp_status}")
+        print(f"  Creds file:  {creds_file.name} → {creds_status}")
+        print(f"  Sync:        {match}")
+        print(f"  Profile:     {server['profile_dir']}")
+
+    print()
+
+
+def refresh_server(server_name: str, headless: bool = False) -> bool:
+    """Extract fresh tokens for a single server.
+
+    Returns True on success.
+    """
+    server = SERVERS[server_name]
+    print(f"\n{'=' * 60}")
+    print(f"Refreshing: {server_name} — {server['description']}")
+    print(f"{'=' * 60}")
+
+    tokens = extract_tokens(
+        workspace_url=server["workspace"],
+        headless=headless,
+        profile_dir=server["profile_dir"],
+    )
+
+    if not tokens:
+        print(f"\nFailed to extract tokens for {server_name}")
+        return False
+
+    print(f"\nExtracted tokens for {server_name}:")
+    print(f"  XOXC: {tokens['xoxc_token'][:25]}...")
+    print(f"  XOXD: {tokens['xoxd_token'][:25]}...")
+
+    updated = store_tokens(server_name, tokens)
+    print(f"\nUpdated stores:")
+    for store in updated:
+        print(f"  ✓ {store}")
+
+    return True
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract Slack XOXC and XOXD tokens using Playwright",
+        description="Extract Slack tokens per MCP server (isolated browser profiles)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Servers:
+  slack       Primary read/write MCP (Work)
+  slack-cncf  Read-only CNCF fork (job searching)
+  slack-k8s   Read-only K8s workspace
+  all         Refresh all servers sequentially
+
 Examples:
-  %(prog)s                           # Interactive mode
-  %(prog)s --headless                # Headless (needs prior login)
-  %(prog)s --workspace https://myco.slack.com
-  %(prog)s --output ~/.config/slack/tokens.env
+  %(prog)s --server slack              # Refresh primary
+  %(prog)s --server slack-cncf         # Refresh CNCF
+  %(prog)s --server all                # Refresh everything
+  %(prog)s --status                    # Show current state
+  %(prog)s --server slack --headless   # Headless (needs prior login)
         """,
     )
     parser.add_argument(
-        "--workspace",
-        "-w",
-        default="https://app.slack.com/client/",
-        help="Slack workspace URL (default: app.slack.com)",
+        "--server",
+        "-s",
+        choices=list(SERVERS.keys()) + ["all"],
+        help="Which MCP server to refresh tokens for",
     )
     parser.add_argument(
         "--headless",
         action="store_true",
-        help="Run in headless mode (requires existing session)",
+        help="Run in headless mode (requires existing session in the profile)",
     )
     parser.add_argument(
-        "--output",
-        "-o",
-        default=DEFAULT_OUTPUT_FILE,
-        help=f"Output file for tokens (default: {DEFAULT_OUTPUT_FILE})",
-    )
-    parser.add_argument(
-        "--profile-dir",
-        type=Path,
-        default=DEFAULT_PROFILE_DIR,
-        help=f"Browser profile directory (default: {DEFAULT_PROFILE_DIR})",
-    )
-    parser.add_argument(
-        "--no-save",
+        "--status",
         action="store_true",
-        help="Don't prompt to save tokens to file",
+        help="Show current token status for all servers",
+    )
+    parser.add_argument(
+        "--workspace",
+        "-w",
+        help="Override workspace URL (default: per-server config)",
     )
 
     args = parser.parse_args()
 
-    print("=" * 60)
-    print("Slack Token Extractor - Playwright Edition")
-    print("=" * 60)
-    print()
+    if args.status:
+        show_status()
+        return
 
-    tokens = extract_tokens(
-        workspace_url=args.workspace,
-        headless=args.headless,
-        profile_dir=args.profile_dir,
-    )
+    if not args.server:
+        parser.error("--server or --status is required")
 
-    if not tokens:
+    targets = list(SERVERS.keys()) if args.server == "all" else [args.server]
+
+    results = {}
+    for name in targets:
+        if args.workspace:
+            SERVERS[name]["workspace"] = args.workspace
+        results[name] = refresh_server(name, headless=args.headless)
+
+    print(f"\n{'=' * 60}")
+    print("Summary")
+    print(f"{'=' * 60}")
+    for name, ok in results.items():
+        status = "✓ OK" if ok else "✗ FAILED"
+        print(f"  {name}: {status}")
+
+    if all(results.values()):
+        print("\nDone! Restart Claude Code to pick up new MCP tokens.")
+    else:
+        failed = [n for n, ok in results.items() if not ok]
+        print(f"\nFailed: {', '.join(failed)}. Re-run without --headless to log in.")
         sys.exit(1)
-
-    print()
-    print("=" * 60)
-    print("Extraction successful!")
-    print("=" * 60)
-    print()
-    print(f"SLACK_MCP_XOXC_TOKEN={tokens['xoxc_token']}")
-    print(f"SLACK_MCP_XOXD_TOKEN={tokens['xoxd_token']}")
-    print()
-
-    if not args.no_save:
-        save_choice = input(f"Save to {args.output}? [Y/n]: ").strip().lower()
-        if save_choice in ("", "y", "yes"):
-            save_tokens(tokens, args.output)
-
-    print("\nDone!")
 
 
 if __name__ == "__main__":
