@@ -73,6 +73,13 @@ SERVERS = {
         "workspace": "https://kubernetes.slack.com",
         "description": "Read-only K8s workspace",
     },
+    "slack-other": {
+        "mcp_name": "slack-other",
+        "profile_dir": BASE_PROFILE_DIR / "profile-slack-other",
+        "creds_file": CREDS_DIR / "credentials-other.json",
+        "workspace": "https://example-work.slack.com",
+        "description": "Other workspace",
+    },
 }
 
 # Scripts that read credentials — they use the primary "slack" creds file
@@ -410,10 +417,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Servers:
-  slack       Primary read/write MCP (Work)
-  slack-cncf  Read-only CNCF fork (job searching)
-  slack-k8s   Read-only K8s workspace
-  all         Refresh all servers sequentially
+  slack        Primary read/write MCP (Work)
+  slack-cncf   Read-only CNCF fork (job searching)
+  slack-k8s    Read-only K8s workspace
+  slack-other Other workspace
+  all          Refresh all servers sequentially
 
 Examples:
   %(prog)s --server slack              # Refresh primary
