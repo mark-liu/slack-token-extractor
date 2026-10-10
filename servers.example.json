@@ -1,0 +1,15 @@
+{
+  "slack": {
+    "mcp_name": "slack",
+    "workspace": "https://example-workspace.slack.com",
+    "creds_file": "credentials.json",
+    "team": "example-workspace",
+    "description": "Primary read/write MCP"
+  },
+  "slack-work": {
+    "mcp_name": "slack-work",
+    "workspace": "https://example-work.slack.com",
+    "creds_file": "credentials-work.json",
+    "description": "Read-only second workspace"
+  }
+}

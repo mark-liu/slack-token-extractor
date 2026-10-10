@@ -6,10 +6,9 @@ Extract Slack XOXC and XOXD tokens using Playwright automation.
 Each MCP server gets its own isolated browser profile and credentials file
 so tokens are independent and don't expire together.
 
-Servers:
-    slack       — primary read/write MCP (Work workspace)
-    slack-cncf  — read-only CNCF fork (job searching)
-    slack-k8s   — read-only K8s workspace
+Servers are defined in ~/.config/slack-token-extractor/servers.json
+(see servers.example.json). Keys are server names; each entry takes
+mcp_name, workspace, creds_file, and optional team, user, description.
 
 Requirements:
     pip install playwright
@@ -19,7 +18,7 @@ Usage:
     # Refresh a specific server's tokens
     python playwright_extract.py --server slack
 
-    # Refresh all servers sequentially (opens browser 3 times)
+    # Refresh all servers sequentially (opens browser once per server)
     python playwright_extract.py --server all
 
     # Headless mode (requires existing session in that profile)
@@ -50,41 +49,39 @@ BASE_PROFILE_DIR = Path.home() / ".slack-token-extractor"
 MCP_CONFIG = Path.home() / ".claude.json"
 CREDS_DIR = Path.home() / ".config" / "slack-cli"
 
-# Each server has: MCP name, browser profile dir, credentials file, workspace URL
-SERVERS = {
-    "slack": {
-        "mcp_name": "slack",
-        "profile_dir": BASE_PROFILE_DIR / "profile-slack",
-        "creds_file": CREDS_DIR / "credentials.json",
-        "workspace": "https://example-workspace.slack.com",
-        "description": "Primary read/write MCP (Work)",
-    },
-    "slack-cncf": {
-        "mcp_name": "slack-cncf",
-        "profile_dir": BASE_PROFILE_DIR / "profile-slack-cncf",
-        "creds_file": CREDS_DIR / "credentials-cncf.json",
-        "workspace": "https://cloud-native.slack.com",
-        "description": "Read-only CNCF fork (job searching)",
-    },
-    "slack-k8s": {
-        "mcp_name": "slack-k8s",
-        "profile_dir": BASE_PROFILE_DIR / "profile-slack-k8s",
-        "creds_file": CREDS_DIR / "credentials-k8s.json",
-        "workspace": "https://kubernetes.slack.com",
-        "description": "Read-only K8s workspace",
-    },
-    "slack-other": {
-        "mcp_name": "slack-other",
-        "profile_dir": BASE_PROFILE_DIR / "profile-slack-other",
-        "creds_file": CREDS_DIR / "credentials-other.json",
-        "workspace": "https://example-work.slack.com",
-        "description": "Other workspace",
-    },
-}
+SERVERS_CONFIG = Path.home() / ".config" / "slack-token-extractor" / "servers.json"
 
-# Scripts that read credentials — they use the primary "slack" creds file
-# (slack-summary.py and slack_pr.py now read from MCP config first)
-SCRIPT_CREDS = CREDS_DIR / "credentials.json"
+
+def load_servers(path: Path = SERVERS_CONFIG) -> dict:
+    """Load per-server definitions from the local JSON config.
+
+    Workspace URLs and team names are user-specific, so they live outside the
+    repo. Each entry gets a derived isolated browser profile directory.
+    """
+    if not path.exists():
+        sys.exit(f"Error: no server config at {path} (copy servers.example.json there)")
+    try:
+        raw = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        sys.exit(f"Error: {path} is not valid JSON: {e}")
+    servers = {}
+    for name, entry in raw.items():
+        missing = {"mcp_name", "workspace", "creds_file"} - entry.keys()
+        if missing:
+            sys.exit(f"Error: server '{name}' in {path} is missing {sorted(missing)}")
+        servers[name] = {
+            "mcp_name": entry["mcp_name"],
+            "profile_dir": BASE_PROFILE_DIR / f"profile-{name}",
+            "creds_file": CREDS_DIR / entry["creds_file"],
+            "workspace": entry["workspace"],
+            "team": entry.get("team", name),
+            "user": entry.get("user", ""),
+            "description": entry.get("description", ""),
+        }
+    return servers
+
+
+SERVERS = load_servers()
 
 
 def extract_tokens(
@@ -314,9 +311,9 @@ def store_tokens(server_name: str, tokens: dict) -> list[str]:
         creds = {
             "token": xoxc,
             "cookie": xoxd,
-            "team": "work",
+            "team": server["team"],
             "team_id": team_id,
-            "user": "mark",
+            "user": server["user"],
             "server": server_name,
         }
         creds_file.write_text(json.dumps(creds, indent=2) + "\n")
@@ -416,16 +413,12 @@ def main():
         description="Extract Slack tokens per MCP server (isolated browser profiles)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Servers:
-  slack        Primary read/write MCP (Work)
-  slack-cncf   Read-only CNCF fork (job searching)
-  slack-k8s    Read-only K8s workspace
-  slack-other Other workspace
-  all          Refresh all servers sequentially
+Servers come from ~/.config/slack-token-extractor/servers.json;
+"all" refreshes every configured server sequentially.
 
 Examples:
   %(prog)s --server slack              # Refresh primary
-  %(prog)s --server slack-cncf         # Refresh CNCF
+  %(prog)s --server slack-work         # Refresh another server
   %(prog)s --server all                # Refresh everything
   %(prog)s --status                    # Show current state
   %(prog)s --server slack --headless   # Headless (needs prior login)
